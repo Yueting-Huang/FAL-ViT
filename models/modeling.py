@@ -1,5 +1,6 @@
-# 减小尺寸的正常操作+集合不同层的损失函数 0.4-91.4%
-# 选择模块的消融实验
+# 增大计算量的大尺寸计算mean 91.7%
+# 进行重叠和细化的消融实验
+# 有细化无重叠
 # coding=utf-8
 from __future__ import absolute_import
 from __future__ import division
@@ -64,7 +65,7 @@ def batch_index_select(x, idx):
     else:
         raise NotImplementedError
 # 新增
-def get_index(idx,patch_num1=19,patch_num2=38):
+def get_index(idx,patch_num1=28,patch_num2=56):
     '''
     get index of fine stage corresponding to coarse stage 
     '''
@@ -196,19 +197,18 @@ class Embeddings(nn.Module):
     def __init__(self, config, img_size, in_channels=3, act_layer=nn.Hardswish):
         super(Embeddings, self).__init__()
         img_size = _pair(img_size)
-
-        patch_size1 = _pair(config.patches1["size"])
-        patch_size2 = _pair(config.patches2["size"])
-        self.average_pool = nn.AvgPool2d(2,stride=2)
-        pad2 = 6    # patch_size=16，slide=12，块数量为38*38，这样能够保证边尺寸为上述的两倍，便于位置定位
-        self.patch_embeddings = Conv2d(in_channels=in_channels,
-                                    out_channels=config.hidden_size,
-                                    kernel_size=patch_size2,
-                                    stride=(config.slide_step, config.slide_step),
-                                    padding=pad2)
-        
-        n_patches2 = ((img_size[0] + 2*pad2 - patch_size2[0]) // config.slide_step + 1) * ((img_size[0] + 2*pad2 - patch_size2[0]) // config.slide_step + 1)
-        n_patches1 = int(n_patches2//4)
+        self.hybrid = None
+        patch_size = _pair(config.patches["size"])
+        # non-overlap
+        n_patches1 = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
+        self.patch_embeddings1 = nn.Conv2d(in_channels, config.hidden_size, kernel_size=patch_size[0], stride=patch_size[0])
+        # overlap
+        pad = 4
+        n_patches2 = (img_size[0] // 8 ) * (img_size[0] // 8 ) 
+        self.patch_embeddings2 = nn.Conv2d(in_channels, config.hidden_size, kernel_size=8, stride=8)
+        # print(((img_size[0] + 2*pad - patch_size) // slide_step + 1))
+        # print("n_patches1",n_patches1)
+        # print("n_patches2",n_patches2)
         self.position_embeddings1 = nn.Parameter(torch.zeros(1, n_patches1+1, config.hidden_size))
         self.position_embeddings2 = nn.Parameter(torch.zeros(1, n_patches2+1, config.hidden_size))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
@@ -216,21 +216,27 @@ class Embeddings(nn.Module):
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
     def forward(self, x):
-        B = x.shape[0]
+        B, C, H, W = x.shape
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = self.patch_embeddings(x)
-        embeddings1 = self.average_pool(x)
-        x = x.flatten(2)
-        x = x.transpose(-1, -2)
-        embeddings2 = torch.cat((cls_tokens, x), dim=1)
-        embeddings2 = embeddings2 + self.position_embeddings2
-        embeddings2 = self.dropout(embeddings2)
+        x2 = x
+        if self.hybrid:
+            x = self.hybrid_model(x)
+        x = self.patch_embeddings1(x)  # b,c,h,w
+        x = x.flatten(2)  # b,c,h,w -> b,c h*w
+        x = x.transpose(-1, -2)  # b,c,h*w -> b,h*w,c
+        x = torch.cat((cls_tokens, x), dim=1)  # b,h*w+1,c
 
-        embeddings1 = embeddings1.flatten(2)
-        embeddings1 = embeddings1.transpose(-1, -2)
-        embeddings1 = torch.cat((cls_tokens, embeddings1), dim=1)
-        embeddings1 = embeddings1 + self.position_embeddings1
+        x2 = self.patch_embeddings2(x2)  # b,c,h,w
+        x2 = x2.flatten(2)  # b,c,h,w -> b,c h*w
+        x2 = x2.transpose(-1, -2)  # b,c,h*w -> b,h*w,c
+        x2 = torch.cat((cls_tokens, x2), dim=1)  # b,h*w+1,c
+
+        embeddings1 = x + self.position_embeddings1
         embeddings1 = self.dropout(embeddings1)
+
+        embeddings2 = x2 + self.position_embeddings2
+        embeddings2 = self.dropout(embeddings2)
+        # print(embeddings1.shape,embeddings2.shape)
 
         return embeddings1, embeddings2
 
@@ -370,12 +376,11 @@ class Transformer(nn.Module):
         self.alpha = 0.4
         self.beta = 0.99
         global_attention = 0
-
+        import_token_num = math.ceil(self.alpha * 28 * 28)
         # 一阶段，将不重叠的patch(19*19)输入到encoder当中
         hidden_states1, weights1, _ = self.encoder(embedding_out1)
-        import_token_num = math.ceil(self.alpha * 19 * 19)   
-        # 分数整合及位置转换
 
+        # 分数整合及位置转换
         # # EMA
         # for index in range(len(weights1)):
         #     atten = weights1[index]
@@ -387,7 +392,7 @@ class Transformer(nn.Module):
 
         # random
         # policy_index = torch.randperm(19*19).unsqueeze(0)
-        # policy_index = policy_index.expand(B, -1).cuda().long()
+        # policy_index = policy_index.expand(B, -1)
         # print("policy_index",policy_index.shape)
 
         # mean
@@ -398,18 +403,18 @@ class Transformer(nn.Module):
         cls_attn = global_attention.mean(dim=1)[:,0,1:] # (B,num_head,N,N)->(B,N,N)->(B,1,N-1) 相当于求cls和其他patch的相关性
         policy_index = torch.argsort(cls_attn, dim=1, descending=True) # 把排序下标返回
         # print("policy_index",policy_index.shape)
-
+        
         important_index = policy_index[:, :import_token_num]
         important_index = get_index(important_index)
-        cls_index = torch.zeros((B,1)).long()
-        # cls_index = torch.zeros((B,1)).cuda().long()
+        # cls_index = torch.zeros((B,1)).long()
+        cls_index = torch.zeros((B,1)).cuda().long()
         important_index = torch.cat((cls_index, important_index+1), dim=1)
         important_tokens = batch_index_select(embedding_out2, important_index)
 
         # 二阶段，将重叠patch(38*38)输入到encoder当中
         hidden_states2, attn_weights2, clss= self.encoder(important_tokens)
         
-        return hidden_states1[:,0],clss,cls_attn
+        return hidden_states1[:,0],clss
 
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, smoothing_value=0, zero_head=False):
@@ -429,7 +434,7 @@ class VisionTransformer(nn.Module):
         )
 
     def forward(self, x, labels=None):
-        cls1, clss ,cls_attn= self.transformer(x)
+        cls1, clss = self.transformer(x)
         final_cls = torch.cat((clss[-3], clss[-2], clss[-1]), dim=-1)
         logits1 = self.part_head1(cls1)
         logits2 = self.part_head2(final_cls)
@@ -452,12 +457,14 @@ class VisionTransformer(nn.Module):
             loss = part_loss + contrast_loss + loss3
             return loss, logits2
         else:
-            return logits2, cls_attn
+            return logits2
 
     def load_from(self, weights):
         with torch.no_grad():
-            self.transformer.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
-            self.transformer.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+            self.transformer.embeddings.patch_embeddings1.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+            self.transformer.embeddings.patch_embeddings1.bias.copy_(np2th(weights["embedding/bias"]))
+            # self.transformer.embeddings.patch_embeddings2.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
+            # self.transformer.embeddings.patch_embeddings2.bias.copy_(np2th(weights["embedding/bias"]))
             self.transformer.embeddings.cls_token.copy_(np2th(weights["cls"]))
             self.transformer.encoder.cls_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
             self.transformer.encoder.cls_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
